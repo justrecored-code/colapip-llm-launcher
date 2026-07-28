@@ -4,7 +4,7 @@
 import type { Plugin, PluginConfig, PluginContext, Task, TaskResult } from "../../src/core/plugin.js";
 import { loadConfig } from "../../src/core/config.js";
 import { ERR_SERVICE_DOWN } from "../../src/core/error-codes.js";
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, execSync, type ChildProcess } from "child_process";
 import fs from "fs-extra";
 import path from "path";
 
@@ -34,6 +34,7 @@ function startProcess(cmd: string, args: string[], ctx: PluginContext, cwd?: str
     stdio: ["ignore", "pipe", "pipe"],
     cwd: cwd || undefined,
     windowsHide: true,
+    detached: process.platform !== "win32",
   });
 
   proc.stdout?.on("data", (data: Buffer) => {
@@ -81,12 +82,23 @@ function stopProcess(ctx: PluginContext): void {
   if (!_process) return;
   ctx.logger.info("正在停止 LLM 进程...");
   const proc = _process;
-  proc.kill("SIGTERM");
   _process = null;
-  _status = "idle";
-  setTimeout(() => {
-    if (!proc.killed) proc.kill("SIGKILL");
-  }, 5000);
+  _status = "idle";  // set before kill so exit handler won't auto-restart
+
+  try {
+    if (process.platform === "win32") {
+      // /T = kill process tree, /F = force
+      execSync(`taskkill /F /T /PID ${proc.pid}`, { stdio: "ignore" });
+    } else {
+      // Negative PID = kill entire process group
+      process.kill(-proc.pid, "SIGTERM");
+      setTimeout(() => {
+        try { process.kill(-proc.pid, "SIGKILL"); } catch { /* already dead */ }
+      }, 3000);
+    }
+  } catch { /* process already dead */ }
+
+  ctx.logger.info("LLM 进程已停止");
 }
 
 // ── Plugin ──
@@ -125,7 +137,7 @@ const llmLauncherPlugin: Plugin = {
       _restartCount = 0;
       startProcess(cmd, args, ctx, def?.cwd);
       // Stay running until stopped or aborted
-      while (_status !== "idle" && !ctx.aborted) await new Promise(r => setTimeout(r, 2000));
+      while (_status !== "idle" && !ctx.signal.aborted) await new Promise(r => setTimeout(r, 500));
       if (_process) stopProcess(ctx);
       return { success: true, data: { status: "stopped" } };
     }
